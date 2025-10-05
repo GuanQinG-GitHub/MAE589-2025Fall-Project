@@ -6,14 +6,27 @@ This repository is set up for cross-platform development with the following bran
 
 ### Branches
 
-- **`main`**: Stable, production-ready code
+- **`master`**: Stable, production-ready code (merged from both platforms)
+- **`macos-mujoco-tutorials`**: macOS-specific MuJoCo physics simulation tutorials
 - **`windows-rl-training`**: Windows-specific RL training code and configurations
-- **`macos-mujoco-dev`**: macOS-specific MuJoCo development and testing
 - **`development`**: General development and integration testing
 
-### Current Branch: `windows-rl-training`
+### Current Branch: `development`
 
-You are currently on the `windows-rl-training` branch, which is perfect for:
+You are currently on the `development` branch, which is perfect for:
+- Testing cross-platform compatibility
+- Integration work between macOS and Windows components
+- General development and experimentation
+
+### Platform-Specific Branches
+
+**`macos-mujoco-tutorials`** - For macOS development:
+- MuJoCo physics simulation tutorials
+- Interactive 3D visualizations
+- Data collection and analysis scripts
+- Video generation and plotting
+
+**`windows-rl-training`** - For Windows RL training:
 - Isaac Lab/Isaac Sim installation and configuration
 - RL training experiments
 - Windows-specific optimizations
@@ -37,11 +50,11 @@ git push origin windows-rl-training
 
 ### macOS MuJoCo Development
 ```bash
-git checkout macos-mujoco-dev
-# Work on MuJoCo development, testing, etc.
+git checkout macos-mujoco-tutorials
+# Work on MuJoCo tutorials, testing, etc.
 git add .
-git commit -m "macOS MuJoCo development updates"
-git push origin macos-mujoco-dev
+git commit -m "macOS MuJoCo tutorial updates"
+git push origin macos-mujoco-tutorials
 ```
 
 ### Merging Changes
@@ -52,9 +65,9 @@ git merge development
 git push origin main
 
 # Merge platform-specific work
-git checkout main
+git checkout master
 git merge windows-rl-training
-git merge macos-mujoco-dev
+git merge macos-mujoco-tutorials
 ```
 
 ## File Organization
