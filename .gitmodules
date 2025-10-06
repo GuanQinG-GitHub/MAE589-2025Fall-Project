@@ -1,0 +1,3 @@
+[submodule "external/unitree_mujoco"]
+	path = external/unitree_mujoco
+	url = https://github.com/unitreerobotics/unitree_mujoco.git
