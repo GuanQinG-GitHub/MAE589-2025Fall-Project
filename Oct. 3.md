@@ -1,0 +1,28 @@
+Meeting minutes
+- task 1: find existing G2 walking
+- task 2: change the terrain
+- task 3: sync the progress
+- task 4: test and collect metrics, changing the ankle controller? 
+- Xinyi has training experience
+  - if we want to re-train or not?
+    - if existing one is not functioning, we need to train
+
+- Plan
+  - individually following tutorials to install Mujoco, get farmiliar with Mujoco (at least how to load the model), and train the walking policy for Unitree G1 humanoid robot
+    - Mujoco download
+      - official doc: https://github.com/google-deepmind/mujoco
+      - version: 3.3.6 (the latest one)
+      - suggestions: using isolated virtual environment, e.g., conda, to avoid version conflicts
+    - (optional) play with Mujoco official tutorial to get farmiliar with loading model
+      - official doc: https://colab.research.google.com/github/google-deepmind/mujoco/blob/main/python/tutorial.ipynb
+      - suggestion: follow the first few blocks will be sufficient
+    - Walking policy training
+      - official docs: see Xinyi's message, and idk what they are at this moment
+      - goal: follow the repo to train a walking policy for G1 from scratch
+      - We're not sure if we will get a working one or not... 
+  - meet next week to sync our progress, and divide later tasks
+    - potential tasks:
+      - change the terrain
+      - define the bio metrics
+      - test and collect the bio performance using the vanilla walking policy with different terrains
+      - (optinal) customize the controller or policy for the ankle joint
