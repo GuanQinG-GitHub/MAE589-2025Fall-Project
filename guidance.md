@@ -23,15 +23,20 @@ This guide provides a streamlined approach to set up Unitree RL training on Wind
 
 ### Create Python Environment
 ```bash
-# Create a new conda environment
+# Create a new conda environment for Isaac Lab (Python 3.11 required)
+conda create -n isaac_lab python=3.11 -y
+
+# Create a separate environment for MuJoCo tutorials (Python 3.10)
 conda create -n unitree_rl python=3.10 -y
 
-# Activate the environment
-conda activate unitree_rl
+# Activate the Isaac Lab environment
+conda activate isaac_lab
 
 # Verify Python version
 python --version
 ```
+
+**Important**: Isaac Sim 5.X requires Python 3.11, so we use `isaac_lab` environment for RL training.
 
 ---
 
