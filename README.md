@@ -11,10 +11,6 @@ xx
 
 xx
 
-## 📁 Project Structure
-
-```
-
 ## 🏃 Quick Start: G1 Pre-trained Policy (Self-contained)
 
 ### 1) Flat Ground Test
@@ -43,6 +39,8 @@ python terrains/g1_perlin_generator.py
 Notes:
 - To change the terrain random pattern: rerun the generator.
 - To change terrain height or position: edit the inline XML in `g1_pretrained_perlin_terrain.py` (hfield `size` for heights; geom `pos` for placement). See `terrains/G1_Perlin_Terrain_Complete_Guide.md` for details.
+
+## 📁 Project Structure
 
 MAE589_Project/
 ├── README.md                           # This file
