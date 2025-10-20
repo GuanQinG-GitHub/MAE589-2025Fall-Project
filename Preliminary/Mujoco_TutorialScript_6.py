@@ -51,10 +51,10 @@ mujoco.mj_forward(model, data2)
 
 print("Starting humanoid simulation with ghost visualization...")
 print("Features:")
-print("- 🤖 Main humanoid: normal appearance")
-print("- 👻 Ghost humanoid: transparent, offset position")
-print("- 🎮 Interactive GUI: real-time control and viewing")
-print("- ⏱️  Duration: 10 seconds")
+print("- Main humanoid: normal appearance")
+print("- Ghost humanoid: transparent, offset position")
+print("- Interactive GUI: real-time control and viewing")
+print("- Duration: 10 seconds")
 
 # Interactive viewer with humanoid simulation
 with mujoco.viewer.launch_passive(model, data) as v:
@@ -70,7 +70,7 @@ with mujoco.viewer.launch_passive(model, data) as v:
     
     # Simulation loop
     start_time = time.time()
-    print("\n🎮 Interactive controls:")
+    print("\nInteractive controls:")
     print("- Mouse: Rotate camera")
     print("- Scroll: Zoom in/out")
     print("- Right-click + drag: Pan camera")
