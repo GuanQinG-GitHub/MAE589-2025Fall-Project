@@ -16,6 +16,7 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 import torch
+from eval import calculate_mos
 
 def load_g1_config():
     """Load G1 configuration parameters."""
@@ -25,7 +26,7 @@ def load_g1_config():
         "robot_xml_path": "robot_models/g1_description/g1_12dof.xml",
         
         # Simulation parameters
-        "simulation_duration": 60.0,  # seconds
+        "simulation_duration": 10.0,  # seconds
         "simulation_dt": 0.002,       # time step
         "control_decimation": 10,     # control frequency = 50Hz
         
@@ -74,27 +75,18 @@ def get_gravity_orientation(quaternion):
     return gravity_orientation
 
 
-def main():
-    print("G1 Perlin Terrain Testing")
-    print("=" * 50)
-    
-    # Load configuration
-    config = load_g1_config()
-    
-    # Load policy
-    policy = load_policy(config['policy_path'])
-    
-    # Read the robot XML and modify it to use the correct mesh path
-    robot_xml_path = config["robot_xml_path"]
+def combine_robot_and_terrain(robot_xml_path):
+    """Combine robot and terrain XML files into a single Mujoco model."""
     with open(robot_xml_path, 'r') as f:
         robot_xml_content = f.read()
-    
+
+        
     # Replace the meshdir directive to use the correct absolute path
     robot_xml_content = robot_xml_content.replace(
         'meshdir="../robot_models/g1_description/meshes/"',
         'meshdir="robot_models/g1_description/meshes/"'
     )
-    
+
     # Create a combined scene by including the robot in the Perlin terrain scene
     combined_xml = f"""
 <mujoco model="g1 with perlin terrain">
@@ -115,8 +107,8 @@ def main():
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
-    <hfield name="perlin_hfield_1" size="3.0 2.0 0.08 0.05" file="../../../terrains/g1_perlin_terrain_1.png" />
-    <material name="perlin_terrain_1_mat" rgba="0.3 0.5 0.3 1" roughness="0.6" />
+    <hfield name="perlin_hfield_1" size="15.0 15.0 0.60 0.01" file="../../../terrains/g1_perlin_terrain_1.png" />
+    <material name="perlin_terrain_1_mat" rgba="0.3 0.5 0.3 1" roughness="0.5" />
   </asset>
 
   <worldbody>
@@ -126,173 +118,184 @@ def main():
   </worldbody>
 </mujoco>
 """
+    return combined_xml
+def main():
+    print("G1 Perlin Terrain Testing")
+    print("=" * 50)
 
-    # Load model with combined robot and Perlin terrain
+    # Load configuration and policy
+    config = load_g1_config()
+    policy = load_policy(config['policy_path'])
+
+    # Prepare model & data
+    combined_xml = combine_robot_and_terrain(config["robot_xml_path"])
     model = mujoco.MjModel.from_xml_string(combined_xml)
-    data = mujoco.MjData(model)
-    
-    # Initialize simulation
-    mujoco.mj_resetData(model, data)
     model.opt.timestep = config['simulation_dt']
-    
-    # Set initial joint positions
-    data.qpos[7:7+12] = config['default_angles']
-    
-    # Initialize variables
-    action = np.zeros(12, dtype=np.float32)
-    target_dof_pos = config['default_angles'].copy()
-    counter = 0
-    
-    # =============================================================================
-    # COMMAND MODIFICATION - Change these values to control robot movement
-    # =============================================================================
-    # Command format: [forward_velocity, lateral_velocity, angular_velocity]
-    # Examples:
-    # cmd = np.array([0.5, 0, 0.2], dtype=np.float32)    # Forward + slight turn
-    # cmd = np.array([0.0, 0.3, 0], dtype=np.float32)    # Sideways movement
-    # cmd = np.array([0.8, 0, 0], dtype=np.float32)      # Fast forward
-    # cmd = np.array([0.2, 0, 0.5], dtype=np.float32)    # Slow forward + sharp turn
-    
-    cmd = np.array([1, 0, 0], dtype=np.float32)
-    # cmd = config['cmd_init'].copy()  # Default: [0.5, 0, 0.2]
-    # =============================================================================
-    
-    # Performance tracking
-    start_time = time.time()
-    fall_count = 0
-    max_height = 0
-    total_distance = 0
-    last_pos = data.qpos[0:3].copy()
-    
-    # Success zone for Perlin terrain area
+
+    # Command setup
+    cmd = config.get("cmd_init", np.array([1.0, 0.0, 0.0], dtype=np.float32)).copy()
+
+    # Success zones (shared across episodes)
     success_zones = [
         {"name": "Perlin Terrain", "pos": [5, 0], "radius": 1.5, "description": "Main Perlin terrain area (moderate complexity)"}
     ]
-    zone_visits = {zone["name"]: False for zone in success_zones}
-    
-    print(f"Command: [forward={cmd[0]:.1f}, lateral={cmd[1]:.1f}, angular={cmd[2]:.1f}]")
-    print("Starting simulation...")
-    
-    # Convert config arrays to numpy
-    kps = np.array(config['kps'], dtype=np.float32)
-    kds = np.array(config['kds'], dtype=np.float32)
-    cmd_scale = config['cmd_scale']  # Already a numpy array in config
-    
-    # Run simulation
+
+    # Evaluation settings
+    num_episodes = 5
+    max_steps = int(config['simulation_duration'] / config['simulation_dt'])
+
+    # Aggregation containers
+    episode_results = []
+    total_falls = 0
+    episodes_with_all_zones = 0
+    episode_mos_means = []
+
+    # Launch viewer once and reuse; data will be reset each episode
+    data = mujoco.MjData(model)
     with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = True
         viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
         viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = True
-        
-        while viewer.is_running():
-            step_start = time.time()
-            
-            # Apply PD control
-            tau = (target_dof_pos - data.qpos[7:7+12]) * kps - data.qvel[6:6+12] * kds
-            data.ctrl[:12] = tau
-            
-            # Step simulation
-            mujoco.mj_step(model, data)
-            counter += 1
-            
-            # Update policy at control frequency (50Hz)
-            if counter % config['control_decimation'] == 0:
-                # Create observation (following Script 8's approach)
-                qj = data.qpos[7:7+config["num_actions"]]  # Joint positions
-                dqj = data.qvel[6:6+config["num_actions"]]  # Joint velocities
-                quat = data.qpos[3:7]  # Base orientation quaternion
-                omega = data.qvel[3:6]  # Base angular velocity
-                
-                # Process observations
-                qj = (qj - config["default_angles"]) * config["dof_pos_scale"]
-                dqj = dqj * config["dof_vel_scale"]
-                gravity_orientation = get_gravity_orientation(quat)
-                omega = omega * config["ang_vel_scale"]
-                
-                # Create periodic signal for walking
-                period = 0.8
-                count = counter * config["simulation_dt"]
-                phase = count % period / period
-                sin_phase = np.sin(2 * np.pi * phase)
-                cos_phase = np.cos(2 * np.pi * phase)
-                
-                # Build observation vector (47 elements)
-                obs = np.zeros(config["num_obs"], dtype=np.float32)
-                obs[:3] = omega
-                obs[3:6] = gravity_orientation
-                obs[6:9] = cmd * cmd_scale
-                obs[9:9+config["num_actions"]] = qj
-                obs[9+config["num_actions"]:9+2*config["num_actions"]] = dqj
-                obs[9+2*config["num_actions"]:9+3*config["num_actions"]] = action
-                obs[9+3*config["num_actions"]:9+3*config["num_actions"]+2] = np.array([sin_phase, cos_phase])
-                
-                # Get action from policy
-                with torch.no_grad():
-                    obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
-                    action = policy(obs_tensor).squeeze().numpy()
-                
-                # Transform action to target joint positions
-                target_dof_pos = action * config['action_scale'] + config['default_angles']
-            
-            # Performance monitoring
-            current_pos_3d = data.qpos[0:3]
-            current_height = current_pos_3d[2]
-            
-            # Track maximum height
-            if current_height > max_height:
-                max_height = current_height
-            
-            # Check for falls
-            if current_height < 0.3:  # Robot fell
-                fall_count += 1
-            
-            # Calculate distance traveled
-            distance = np.linalg.norm(current_pos_3d - last_pos)
-            total_distance += distance
-            last_pos = current_pos_3d.copy()
-            
-            # Check success zones
-            for zone in success_zones:
-                if not zone_visits[zone["name"]]:
-                    zone_pos = np.array(zone["pos"])
-                    robot_pos_2d = current_pos_3d[:2]
-                    if np.linalg.norm(robot_pos_2d - zone_pos) < zone["radius"]:
-                        zone_visits[zone["name"]] = True
-            
-            # Sync viewer
-            viewer.sync()
-            time.sleep(0.01)
-            
-            # Stop after reasonable time
-            if counter > 5000:  # ~50 seconds
-                break
-    
-    # Final performance report
-    elapsed_time = time.time() - start_time
+
+        for ep in range(1, num_episodes + 1):
+            # Initialize per-episode variables (reset simulation state)
+            mujoco.mj_resetData(model, data)
+            counter = 0
+            fall_count = 0
+            max_height = -np.inf
+            total_distance = 0.0
+            last_pos = data.qpos[0:3].copy()
+            kps = np.array(config['kps'], dtype=np.float32)
+            kds = np.array(config['kds'], dtype=np.float32)
+            cmd_scale = config['cmd_scale']
+            target_dof_pos = config['default_angles'].copy()
+            action = np.zeros(config['num_actions'], dtype=np.float32)
+            zone_visits = {zone["name"]: False for zone in success_zones}
+            mos_list = []
+
+            print(f"\n=== Episode {ep}/{num_episodes} ===")
+            print(f"Command: [forward={cmd[0]:.1f}, lateral={cmd[1]:.1f}, angular={cmd[2]:.1f}]")
+            start_time = time.time()
+
+            # Episode simulation loop
+            while viewer.is_running() and counter < max_steps:
+                # PD control (ensure indices match model DOF layout)
+                tau = (target_dof_pos - data.qpos[7:7 + config["num_actions"]]) * kps \
+                        - data.qvel[6:6 + config["num_actions"]] * kds
+                data.ctrl[: config["num_actions"]] = tau
+
+                # Step
+                mujoco.mj_step(model, data)
+                counter += 1
+
+                # Measure MoS this step
+                mos = calculate_mos(model, data)
+                if mos != -np.inf and not np.isnan(mos):
+                    mos_list.append(float(mos))
+
+                # Control update at control frequency
+                if counter % config['control_decimation'] == 0:
+                    # Observations
+                    qj = data.qpos[7:7 + config["num_actions"]].copy()
+                    dqj = data.qvel[6:6 + config["num_actions"]].copy()
+                    quat = data.qpos[3:7].copy()
+                    omega = data.qvel[3:6].copy()
+
+                    qj = (qj - config["default_angles"]) * config["dof_pos_scale"]
+                    dqj = dqj * config["dof_vel_scale"]
+                    gravity_orientation = get_gravity_orientation(quat)
+                    omega = omega * config["ang_vel_scale"]
+
+                    period = 0.8
+                    sim_time = counter * model.opt.timestep
+                    phase = (sim_time % period) / period
+                    sin_phase = np.sin(2 * np.pi * phase)
+                    cos_phase = np.cos(2 * np.pi * phase)
+
+                    obs = np.zeros(config["num_obs"], dtype=np.float32)
+                    obs[:3] = omega
+                    obs[3:6] = gravity_orientation
+                    obs[6:9] = cmd * cmd_scale
+                    obs[9:9 + config["num_actions"]] = qj
+                    obs[9 + config["num_actions"]:9 + 2 * config["num_actions"]] = dqj
+                    # use last action for this slot (safe default)
+                    obs[9 + 2 * config["num_actions"]:9 + 3 * config["num_actions"]] = action
+                    obs[9 + 3 * config["num_actions"]:9 + 3 * config["num_actions"] + 2] = np.array([sin_phase, cos_phase])
+
+                    with torch.no_grad():
+                        obs_tensor = torch.FloatTensor(obs).unsqueeze(0)
+                        action = policy(obs_tensor).squeeze().numpy()
+
+                    # Transform action to target joint positions
+                    target_dof_pos = action * config['action_scale'] + config['default_angles']
+
+                # Performance tracking
+                current_pos_3d = data.qpos[0:3].copy()
+                current_height = float(current_pos_3d[2])
+
+                if current_height > max_height:
+                    max_height = current_height
+
+                # Fall detection
+                if current_height < 0.5:
+                    fall_count += 1
+                    break  # end episode on fall
+
+                # Distance traveled
+                distance = np.linalg.norm(current_pos_3d - last_pos)
+                total_distance += float(distance)
+                last_pos = current_pos_3d.copy()
+
+                # Success zone checks
+                for zone in success_zones:
+                    if not zone_visits[zone["name"]]:
+                        zone_pos = np.array(zone["pos"], dtype=np.float32)
+                        robot_pos_2d = current_pos_3d[:2]
+                        if np.linalg.norm(robot_pos_2d - zone_pos) < zone["radius"]:
+                            zone_visits[zone["name"]] = True
+
+                # Viewer sync and pacing
+                viewer.sync() if counter % 10 == 0 else None
+                time.sleep(0.001)
+
+            # Episode summary & aggregation
+            ep_elapsed = time.time() - start_time
+            ep_mos_mean = float(np.mean(mos_list)) if mos_list else float('nan')
+            episode_mos_means.append(ep_mos_mean)
+            total_falls += fall_count
+            if all(zone_visits.values()):
+                episodes_with_all_zones += 1
+
+            episode_results.append({
+                "episode": ep,
+                "steps": counter,
+                "distance": total_distance,
+                "max_height": max_height,
+                "falls": fall_count,
+                "mos_mean": ep_mos_mean,
+                "zones": zone_visits,
+                "elapsed": ep_elapsed
+            })
+
+            # Print episode brief
+            print(f"Episode {ep} finished: steps={counter}, distance={total_distance:.2f}, max_h={max_height:.3f}, falls={fall_count}, mos_mean={ep_mos_mean:.2f}")
+
+    # Aggregate results across episodes
+    success_rate = episodes_with_all_zones / num_episodes * 100.0
+    mos_mean = float(np.nanmean(episode_mos_means)) if episode_mos_means else float('nan')
+    mos_std = float(np.nanstd(episode_mos_means)) if episode_mos_means else float('nan')
+
     print("\n" + "=" * 50)
-    print("PERLIN TERRAIN TEST RESULTS")
+    print("AGGREGATED PERLIN TERRAIN EVALUATION")
     print("=" * 50)
-    print(f"Simulation time: {elapsed_time:.1f} seconds")
-    print(f"Total steps: {counter}")
-    print(f"Total distance traveled: {total_distance:.2f} meters")
-    print(f"Maximum height reached: {max_height:.3f} meters")
-    print(f"Number of falls: {fall_count}")
-    print()
-    print("Success zones reached:")
-    for zone_name, reached in zone_visits.items():
-        status = "YES" if reached else "NO"
-        print(f"  - {zone_name}: {status}")
-    print()
-    
-    # Performance assessment
-    if fall_count == 0 and all(zone_visits.values()):
-        print("EXCELLENT: Robot successfully navigated the Perlin terrain!")
-    elif fall_count <= 2 and sum(zone_visits.values()) >= 1:
-        print("GOOD: Robot handled the Perlin terrain challenges well.")
-    elif fall_count <= 5:
-        print("FAIR: Robot struggled with some Perlin terrain but made progress.")
-    else:
-        print("POOR: Robot had significant difficulty with the Perlin terrain.")
+    print(f"Episodes run: {num_episodes}")
+    print(f"Total falls: {total_falls}")
+    print(f"Success rate (all zones reached): {success_rate:.1f}%")
+    print(f"MoS across episodes: mean={mos_mean:.2f}, std={mos_std:.2f}")
+    print("\nPer-episode summary:")
+    for r in episode_results:
+        zones_str = ", ".join([f"{k}:{'YES' if v else 'NO'}" for k, v in r["zones"].items()])
+        print(f"  Ep{r['episode']}: steps={r['steps']}, dist={r['distance']:.2f}, falls={r['falls']}, mos_mean={r['mos_mean']:.2f}, zones=[{zones_str}]")
 
 if __name__ == "__main__":
     main()

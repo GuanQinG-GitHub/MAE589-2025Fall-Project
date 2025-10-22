@@ -84,7 +84,7 @@ def create_perlin_terrain_1(asset, worldbody, output_dir):
     
     # Generate height map for terrain 1
     terrain_1 = generate_perlin_heightmap(
-        width=128, height=128,     # 128x128 pixel resolution
+        width=128 * 2, height=128 * 2,     # 128x128 pixel resolution
         scale=40.0,                # Moderate detail level
         octaves=6,                 # 6 noise layers for moderate complexity
         persistence=0.5,           # 50% amplitude reduction per octave
