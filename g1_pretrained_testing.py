@@ -79,7 +79,7 @@ def load_g1_config():
         "num_obs": 47,      # observation space size
         
         # Initial command (forward velocity, lateral velocity, angular velocity)
-        "cmd_init": np.array([0.5, 0, 0.2], dtype=np.float32)
+        "cmd_init": np.array([0.5, 0, 0], dtype=np.float32)
     }
     return config
 

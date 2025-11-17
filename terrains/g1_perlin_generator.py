@@ -22,7 +22,7 @@ ROBOT = "g1"                                    # Robot type identifier
 INPUT_SCENE_PATH = "./terrains/scene.xml"       # Path to the base MuJoCo scene template
 # Note: No longer generating scene_perlin_terrain.xml as it's not used by the scripts
 
-def generate_perlin_heightmap(width, height, scale=50.0, octaves=6, persistence=0.5, lacunarity=2.0, seed=None):
+def generate_perlin_heightmap(width, height, scale=50.0, octaves=10, persistence=0.5, lacunarity=2.0, seed=None):
     """
     Generate a heightmap using Perlin noise (simplex noise).
     
@@ -91,7 +91,7 @@ def create_perlin_terrain_1(asset, worldbody, output_dir):
         lacunarity=2.0,            # Double frequency each octave
         seed=42                    # Fixed seed for reproducible terrain
     )
-    cv2.imwrite(output_dir + "g1_perlin_terrain_1.png", terrain_1)  # Save as PNG image
+    cv2.imwrite(output_dir + "g1_perlin_terrain_2.png", terrain_1)  # Save as PNG image
     
     # Create height field asset
     hfield1 = xml_et.SubElement(asset, "hfield")

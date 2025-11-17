@@ -115,7 +115,7 @@ def main():
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
-    <hfield name="perlin_hfield_1" size="3.0 2.0 0.08 0.05" file="../../../terrains/g1_perlin_terrain_1.png" />
+    <hfield name="perlin_hfield_1" size="3.0 2.0 0.08 0.02" file="../../../terrains/g1_perlin_terrain_2.png" />
     <material name="perlin_terrain_1_mat" rgba="0.3 0.5 0.3 1" roughness="0.6" />
   </asset>
 
