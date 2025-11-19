@@ -1,201 +1,233 @@
-"""
-Training script for G1 Residual RL - Ankle Impedance Scheduling
-This script trains a residual network to adapt ankle PD parameters
-for uneven terrain while keeping the base policy frozen.
-"""
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
 
+"""Script to train residual RL agent with RSL-RL for G1 ankle impedance scheduling."""
+
+"""Launch Isaac Sim Simulator first."""
+
+import argparse
+import sys
+
+from isaaclab.app import AppLauncher
+
+# local imports
+# Add current directory to path for cli_args import
 import sys
 import os
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+import cli_args  # isort: skip
 
-# Add legged_gym to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'external', 'unitree_rl_gym'))
+# add argparse arguments
+parser = argparse.ArgumentParser(description="Train a residual RL agent with RSL-RL for G1 ankle impedance scheduling.")
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument("--task", type=str, default="Unitree-G1-Residual-Velocity", help="Name of the task.")
+parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
+)
+parser.add_argument(
+    "--base_policy_path",
+    type=str,
+    default=None,
+    help="Path to pretrained base policy (default: trained_models/motion.pt)",
+)
+# append RSL-RL cli arguments
+cli_args.add_rsl_rl_args(parser)
+# append AppLauncher cli args
+AppLauncher.add_app_launcher_args(parser)
+args_cli, hydra_args = parser.parse_known_args()
 
-from legged_gym import LEGGED_GYM_ROOT_DIR
-from legged_gym.utils import get_args, task_registry
-from legged_gym.utils.helpers import class_to_dict
+# always enable cameras to record video
+if args_cli.video:
+    args_cli.enable_cameras = True
 
-import isaacgym
+# clear out sys.argv for Hydra
+sys.argv = [sys.argv[0]] + hydra_args
+
+# launch omniverse app
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+"""Check for minimum supported RSL-RL version."""
+
+import importlib.metadata as metadata
+import platform
+
+from packaging import version
+
+# for distributed training, check minimum supported rsl-rl version
+RSL_RL_VERSION = "2.3.1"
+installed_version = metadata.version("rsl-rl-lib")
+if args_cli.distributed and version.parse(installed_version) < version.parse(RSL_RL_VERSION):
+    if platform.system() == "Windows":
+        cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+    else:
+        cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+    print(
+        f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
+        f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
+        f"\n\n\t{' '.join(cmd)}\n"
+    )
+    exit(1)
+
+"""Rest everything follows."""
+
+import gymnasium as gym
+import inspect
+import os
+import shutil
 import torch
+from datetime import datetime
+
+from rsl_rl.runners import OnPolicyRunner  # TODO: Consider printing the experiment name in the terminal.
+
+import isaaclab_tasks  # noqa: F401
+from isaaclab.envs import (
+    DirectMARLEnv,
+    DirectMARLEnvCfg,
+    DirectRLEnvCfg,
+    ManagerBasedRLEnvCfg,
+    multi_agent_to_single_agent,
+)
+from isaaclab.utils.dict import print_dict
+from isaaclab.utils.io import dump_pickle, dump_yaml
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_tasks.utils import get_checkpoint_path
+from isaaclab_tasks.utils.hydra import hydra_task_config
+
+# Import residual RL task
+# Add project root to path for imports
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+import residual_rl_training.tasks  # noqa: F401
+from residual_rl_training.utils.export_deploy_cfg import export_deploy_cfg
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = False
 
 
-def train_residual(args):
-    """
-    Main training function for residual RL.
-    
-    Args:
-        args: Command line arguments
-    """
-    # ====================================================================
-    # SETUP AND CONFIGURATION
-    # ====================================================================
-    print("=" * 80)
-    print("G1 Residual RL Training - Ankle Impedance Scheduling")
-    print("=" * 80)
-    
-    # Get configurations
-    # Note: We'll register the task in the script
-    from g1_residual_config import G1ResidualCfg, G1ResidualCfgPPO
-    
-    env_cfg = G1ResidualCfg()
-    train_cfg = G1ResidualCfgPPO()
-    
-    # ====================================================================
-    # BASE POLICY PATH CONFIGURATION
-    # ====================================================================
-    # Set path to pretrained base policy
-    # Default: use the motion.pt from deploy folder
-    base_policy_path = getattr(args, 'base_policy_path', None)
-    if base_policy_path is None:
+@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+    """Train with RSL-RL agent for residual RL."""
+    # override configurations with non-hydra CLI arguments
+    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    agent_cfg.max_iterations = (
+        args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
+    )
+
+    # set the environment seed
+    # note: certain randomizations occur in the environment initialization so we set the seed here
+    env_cfg.seed = agent_cfg.seed
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    # Set base policy path if provided
+    if args_cli.base_policy_path is not None:
+        if hasattr(env_cfg, "base_policy_path"):
+            env_cfg.base_policy_path = args_cli.base_policy_path
+        print(f"[INFO] Using base policy from: {args_cli.base_policy_path}")
+    else:
         # Default path to pretrained policy
-        base_policy_path = os.path.join(
-            LEGGED_GYM_ROOT_DIR,
-            'deploy',
-            'pre_train',
-            'g1',
-            'motion.pt'
-        )
-    
-    # Check if base policy exists
-    if not os.path.exists(base_policy_path):
-        print(f"Warning: Base policy not found at {base_policy_path}")
-        print("Training without base policy (not recommended)")
-        base_policy_path = None
-    else:
-        print(f"Using base policy: {base_policy_path}")
-    
-    # Add base policy path to config
-    env_cfg.base_policy_path = base_policy_path
-    
-    # ====================================================================
-    # ENVIRONMENT CREATION
-    # ====================================================================
-    print("\n" + "=" * 80)
-    print("Creating Environment")
-    print("=" * 80)
-    
-    # Override some parameters from command line if provided
-    if hasattr(args, 'num_envs') and args.num_envs is not None:
-        env_cfg.env.num_envs = args.num_envs
-    
-    if hasattr(args, 'headless') and args.headless:
-        args.headless = True
-    else:
-        args.headless = False
-    
-    # Create simulation parameters
-    from legged_gym.utils.helpers import parse_sim_params
-    sim_params = parse_sim_params(args, env_cfg)
-    
-    # Create environment
-    from g1_residual_env import G1ResidualRobot
-    env = G1ResidualRobot(
-        cfg=env_cfg,
-        sim_params=sim_params,
-        physics_engine=args.physics_engine,
-        sim_device=args.sim_device,
-        headless=args.headless
+        default_path = os.path.join(os.path.dirname(__file__), "..", "trained_models", "motion.pt")
+        default_path = os.path.abspath(default_path)
+        if os.path.exists(default_path) and hasattr(env_cfg, "base_policy_path"):
+            env_cfg.base_policy_path = default_path
+            print(f"[INFO] Using default base policy from: {default_path}")
+        elif hasattr(env_cfg, "base_policy_path"):
+            print(f"[WARN] Base policy not found at {default_path}. Training without base policy (not recommended).")
+            env_cfg.base_policy_path = None
+
+    # multi-gpu training configuration
+    if args_cli.distributed:
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+        agent_cfg.device = f"cuda:{app_launcher.local_rank}"
+
+        # set seed to have diversity in different threads
+        seed = agent_cfg.seed + app_launcher.local_rank
+        env_cfg.seed = seed
+        agent_cfg.seed = seed
+
+    # specify directory for logging experiments
+    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+    log_root_path = os.path.abspath(log_root_path)
+    print(f"[INFO] Logging experiment in directory: {log_root_path}")
+    # specify directory for logging runs: {time-stamp}_{run_name}
+    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # This way, the Ray Tune workflow can extract experiment name.
+    print(f"Exact experiment name requested from command line: {log_dir}")
+    if agent_cfg.run_name:
+        log_dir += f"_{agent_cfg.run_name}"
+    log_dir = os.path.join(log_root_path, log_dir)
+
+    # create isaac environment
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # convert to single-agent instance if required by the RL algorithm
+    if isinstance(env.unwrapped, DirectMARLEnv):
+        env = multi_agent_to_single_agent(env)
+
+    # save resume path before creating a new log_dir
+    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+    # wrap for video recording
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print("[INFO] Recording videos during training.")
+        print_dict(video_kwargs, nesting=4)
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    # wrap around environment for rsl-rl
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+    # create runner from rsl-rl
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    # write git state to logs
+    runner.add_git_repo_to_log(__file__)
+    # load the checkpoint
+    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        # load previously trained model
+        runner.load(resume_path)
+
+    # dump the configuration into log-directory
+    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
+    dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+    export_deploy_cfg(env.unwrapped, log_dir)
+    # copy the environment configuration file to the log directory
+    shutil.copy(
+        inspect.getfile(env_cfg.__class__),
+        os.path.join(log_dir, "params", os.path.basename(inspect.getfile(env_cfg.__class__))),
     )
-    
-    print(f"Environment created with {env.num_envs} parallel environments")
-    print(f"Observation space: {env.num_obs} dimensions")
-    print(f"Action space: {env.num_actions} dimensions (ankle impedance modifications)")
-    
-    # ====================================================================
-    # ALGORITHM AND RUNNER SETUP
-    # ====================================================================
-    print("\n" + "=" * 80)
-    print("Setting up PPO Algorithm")
-    print("=" * 80)
-    
-    # Convert config to dictionary
-    train_cfg_dict = class_to_dict(train_cfg)
-    
-    # Create log directory
-    from datetime import datetime
-    log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
-    log_dir = os.path.join(
-        log_root,
-        datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name
-    )
-    os.makedirs(log_dir, exist_ok=True)
-    print(f"Log directory: {log_dir}")
-    
-    # Create algorithm runner
-    from legged_gym.utils import OnPolicyRunner
-    runner = OnPolicyRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
-    
-    # ====================================================================
-    # RESUME TRAINING (IF SPECIFIED)
-    # ====================================================================
-    if train_cfg.runner.resume:
-        from legged_gym.utils.helpers import get_load_path
-        resume_path = get_load_path(
-            log_root,
-            load_run=train_cfg.runner.load_run,
-            checkpoint=train_cfg.runner.checkpoint
-        )
-        if resume_path is not None:
-            print(f"Resuming training from: {resume_path}")
-            runner.load(resume_path)
-        else:
-            print("Warning: Resume requested but no checkpoint found")
-    
-    # ====================================================================
-    # TRAINING LOOP
-    # ====================================================================
-    print("\n" + "=" * 80)
-    print("Starting Training")
-    print("=" * 80)
-    print(f"Max iterations: {train_cfg.runner.max_iterations}")
-    print(f"Steps per env per iteration: {train_cfg.runner.num_steps_per_env}")
-    print(f"Total environment steps per iteration: {env.num_envs * train_cfg.runner.num_steps_per_env}")
-    print("=" * 80)
-    
-    # Start training
-    runner.learn(
-        num_learning_iterations=train_cfg.runner.max_iterations,
-        init_at_random_ep_len=True
-    )
-    
-    print("\n" + "=" * 80)
-    print("Training Complete!")
-    print(f"Final model saved to: {log_dir}")
-    print("=" * 80)
+
+    # run training
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+
+    # close the simulator
+    env.close()
 
 
-if __name__ == '__main__':
-    # ====================================================================
-    # COMMAND LINE ARGUMENTS
-    # ====================================================================
-    from legged_gym.utils import get_args
-    
-    # Parse arguments
-    args = get_args()
-    
-    # Add custom arguments for residual training
-    import argparse
-    parser = argparse.ArgumentParser(description='Train G1 Residual RL')
-    parser.add_argument(
-        '--base_policy_path',
-        type=str,
-        default=None,
-        help='Path to pretrained base policy (default: deploy/pre_train/g1/motion.pt)'
-    )
-    parser.add_argument(
-        '--num_envs',
-        type=int,
-        default=None,
-        help='Number of parallel environments (default: from config)'
-    )
-    
-    # Merge with existing args
-    residual_args = parser.parse_args()
-    for key, value in vars(residual_args).items():
-        if value is not None:
-            setattr(args, key, value)
-    
-    # ====================================================================
-    # RUN TRAINING
-    # ====================================================================
-    train_residual(args)
-
+if __name__ == "__main__":
+    # run the main function
+    main()
+    # close sim app
+    simulation_app.close()
