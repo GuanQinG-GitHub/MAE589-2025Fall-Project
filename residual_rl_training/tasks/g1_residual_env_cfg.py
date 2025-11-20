@@ -39,21 +39,8 @@ from unitree_rl_lab.tasks.locomotion import mdp
 # Base policy path (will be set via CLI or default)
 base_policy_path = None
 
-# Terrain configuration for uneven terrain training
-UNEVEN_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
-    size=(8.0, 8.0),
-    border_width=20.0,
-    num_rows=10,
-    num_cols=20,
-    horizontal_scale=0.1,
-    vertical_scale=0.05,  # Higher vertical scale for uneven terrain
-    slope_threshold=0.75,
-    difficulty_range=(0.0, 1.0),
-    use_cache=False,
-    sub_terrains={
-        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.3),  # Less flat terrain
-    },
-)
+# Flat terrain configuration for debugging
+FLAT_TERRAIN_CFG = terrain_gen.MeshPlaneTerrainCfg()
 
 
 @configclass
@@ -63,9 +50,9 @@ class RobotSceneCfg(InteractiveSceneCfg):
     # ground terrain - uneven terrain for residual RL training
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="generator",
-        terrain_generator=UNEVEN_TERRAIN_CFG,
-        max_init_terrain_level=UNEVEN_TERRAIN_CFG.num_rows - 1,
+        terrain_type="plane",
+        terrain_generator=FLAT_TERRAIN_CFG,
+        max_init_terrain_level=0,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -85,7 +72,7 @@ class RobotSceneCfg(InteractiveSceneCfg):
 
     # sensors
     height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+        prim_path="{ENV_REGEX_NS}/Robot/pelvis",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
@@ -124,7 +111,7 @@ class EventCfg:
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
             "mass_distribution_params": (-1.0, 3.0),
             "operation": "add",
         },
@@ -135,7 +122,7 @@ class EventCfg:
         func=mdp.apply_external_force_torque,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
             "force_range": (0.0, 0.0),
             "torque_range": (-0.0, 0.0),
         },
@@ -190,7 +177,7 @@ class CommandsCfg:
             lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-0.1, 0.1)
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-0.2, 0.2)
+            lin_vel_x=(-0.1, 0.1), lin_vel_y=(-0.1, 0.1), ang_vel_z=(-0.1, 0.1)
         ),
     )
 
@@ -206,7 +193,7 @@ class ActionsCfg:
     JointPositionAction = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*ankle.*"],  # Only ankle joints for residual actions
-        scale=0.25,
+        scale=0.25,  # Freeze residual output to zero to mirror base policy
         use_default_offset=True,
     )
 
@@ -340,7 +327,7 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+    terrain_levels = None
     lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
 
 

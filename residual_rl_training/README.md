@@ -131,6 +131,17 @@ Actions are in range [-1, 1], scaled to modify kp by ±25% of base value (40 N�
 - Left leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll (6 DOF)
 - Right leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll (6 DOF)
 
+## Training Setup
+
+Follow the checklist below before running any experiment:
+
+1. **Assets installed**: Isaac Lab source packages, Unitree RL Lab (`pip install -e .`), and `rsl-rl-lib>=2.3.1`.
+2. **USDs verified**: `UNITREE_G1_12DOF_CFG.usd_path` points to `unitree_rl_lab/unitree_model/G1/12dof/usd/g1_12dof_rev_1_0/g1_12dof_rev_1_0.usd`. Open it once in Isaac Sim to confirm the pelvis prim and sensors exist.
+3. **Base policy ready**: Place `trained_models/motion.pt` or pass `--base_policy_path`. The script prints which file is used.
+4. **Isaac Sim launcher**: Use the Isaac Sim Python executable (`D:\software\isaac_sim\python.bat`) so Omniverse libraries and CUDA are available.
+5. **GPU + GUI choice**: Add `--headless` for faster training. Drop the flag when you want to inspect the robot in the Isaac Sim GUI.
+6. **Logging**: Runs are saved under `logs/rsl_rl/g1_residual_impedance/<timestamp>`. Verify disk space before long jobs.
+
 ## Usage
 
 ### Basic Training (Windows)
@@ -282,6 +293,42 @@ A: The environment will warn and use zero actions for the base policy. This is u
 - [ ] Add more observations (foot heights, velocities, terrain height map)
 - [ ] Extend to multiple joints (knee, hip)
 - [ ] Implement curriculum learning for terrain difficulty
+
+## Customize Uneven Terrain
+
+The terrain used during training is defined in `tasks/g1_residual_env_cfg.py` via `UNEVEN_TERRAIN_CFG` and the downstream `TerrainImporterCfg`. To change the difficulty:
+
+1. **Geometry scale**: Tweak `horizontal_scale` (cell spacing) and `vertical_scale` (height amplitude). Larger vertical scale produces sharper obstacles.
+2. **Generator size**: Increase `size`, `num_rows`, and `num_cols` if robots run out of walkable area when curriculum is enabled.
+3. **Difficulty bands**: Edit `difficulty_range` and `max_init_terrain_level` to control how curriculum progresses. Lower `max_init_terrain_level` starts agents on easier terrain.
+4. **Sub-terrains**: Add entries into `sub_terrains` (e.g., `stairs`, `pits`) using the presets from `isaaclab.terrains`. Each entry’s `proportion` decides how often it appears.
+5. **Materials**: Adjust friction/rest parameters in the `TerrainImporterCfg.physics_material` block to test slippery or compliant surfaces.
+
+After modifications, re-run training; no asset regeneration is required because the generator creates meshes procedurally at startup.
+
+## Customize Observations and Rewards
+
+Both observation and reward definitions live in `tasks/g1_residual_env_cfg.py` and rely on Isaac Lab’s manager system:
+
+- **Observations**: Extend `ObservationsCfg.PolicyCfg` or `CriticCfg` with new `ObsTerm` entries. Each term references a function from `unitree_rl_lab.tasks.locomotion.mdp` (or your own). Example:
+
+  ```python
+  foot_heights = ObsTerm(func=mdp.foot_height, params={"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
+  ```
+
+  Set `history_length`, `concatenate_terms`, and noise via the `__post_init__` method. If you need sensors not provided by default, register them in `RobotSceneCfg` and reference them through `SceneEntityCfg`.
+
+- **Rewards**: Add or edit entries inside `RewardsCfg`. Each `RewTerm` specifies a callable, weight, and optional parameters. For example, to encourage symmetric torques:
+
+  ```python
+  torque_symmetry = RewTerm(func=mdp.torque_symmetry, weight=-0.05)
+  ```
+
+  Use positive weights for incentives and negative weights for penalties. Remember to keep magnitudes balanced; large penalties can dominate training.
+
+- **Terminations/Curriculum**: Related adjustments live in `TerminationsCfg` and `CurriculumCfg`. Pair reward shaping with appropriate dones (e.g., lowering `minimum_height` if you allow crouching gaits).
+
+After editing the config, simply re-launch `train_residual.py`. Hydra reloads the Python config on every run, so no recompilation is needed.
 
 ## Troubleshooting
 

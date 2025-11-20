@@ -7,11 +7,13 @@
 
 import numpy as np
 import torch
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, Sequence
 
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils import math as math_utils
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -46,6 +48,20 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
         super().__init__(cfg, **kwargs)
         
         # ====================================================================
+        # ACTION MANAGER TERM LOOKUP
+        # ====================================================================
+        self._residual_action_term_name = None
+        if hasattr(self, "action_manager") and self.action_manager is not None:
+            if "JointPositionAction" in self.action_manager.active_terms:
+                self._residual_action_term_name = "JointPositionAction"
+            elif self.action_manager.active_terms:
+                self._residual_action_term_name = self.action_manager.active_terms[0]
+            else:
+                raise RuntimeError("Action manager has no active terms configured for residual actions.")
+        else:
+            raise RuntimeError("Action manager is not initialized. Residual actions cannot be processed.")
+
+        # ====================================================================
         # BASE POLICY LOADING
         # ====================================================================
         self.base_policy = None
@@ -64,6 +80,7 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
                 
                 self.base_policy_loaded = True
                 print(f"[INFO] Loaded base policy from: {self.base_policy_path}")
+                self._initialize_base_policy_memory()
             except Exception as e:
                 print(f"[WARN] Could not load base policy: {e}")
                 print("[WARN] Training without base policy (not recommended)")
@@ -124,6 +141,12 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
         self.current_ankle_kd = torch.full(
             (num_envs, 4), self.base_ankle_kd, dtype=torch.float, device=self.device
         )
+        self.joint_effort_limits = self._build_joint_effort_limits(robot)
+        self.debug_log = getattr(cfg, "debug_log", True)
+        self.debug_log_interval = getattr(cfg, "debug_log_interval", 200)
+        self.debug_max_logs = getattr(cfg, "debug_max_logs", 20)
+        self._debug_step_counter = 0
+        self._debug_logs_emitted = 0
         
         # ====================================================================
         # BASE POLICY OBSERVATION SCALES
@@ -162,86 +185,64 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
 
     def step(self, action: torch.Tensor):
         """
-        Override step function to integrate base policy and residual actions.
-        
-        This method intercepts the action before it's applied, gets base policy
-        actions, computes torques with modified PD parameters, and applies them.
-        
-        **Important**: We apply torques directly, bypassing the normal action
-        application. The parent's step() may still process actions through the
-        action manager, but those processed actions should not be applied to
-        the robot since we've already applied torques directly.
-        
-        Args:
-            action: Residual actions from RL policy [num_envs, 4] (ankle PD modifications)
-            
-        Returns:
-            observations, rewards, dones, infos (standard gymnasium format)
+        Override step to inject custom torque computation while preserving Isaac Lab bookkeeping.
         """
-        # Update episode length for phase computation
+        action = action.to(self.device)
+        self.action_manager.process_action(action)
+        self.recorder_manager.record_pre_step()
+        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self.action_manager.apply_action()
+            self._compute_and_apply_residual_torques()
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.recorder_manager.record_post_physics_decimation_step()
+            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+                self.sim.render()
+            self.scene.update(dt=self.physics_dt)
         self.episode_length_buf += 1
-        
-        # Apply our custom action processing (computes and applies torques)
-        self._apply_residual_action(action)
-        
-        # Call parent step to handle simulation stepping, observations, rewards, etc.
-        # Note: The parent may process actions through the action manager, but since
-        # we've already applied torques directly, those processed actions won't affect
-        # the robot. The parent's step() will handle simulation stepping and observation/reward computation.
-        return super().step(action)
+        self.common_step_counter += 1
+        self.reset_buf = self.termination_manager.compute()
+        self.reset_terminated = self.termination_manager.terminated
+        self.reset_time_outs = self.termination_manager.time_outs
+        self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
+        if len(self.recorder_manager.active_terms) > 0:
+            self.obs_buf = self.observation_manager.compute()
+            self.recorder_manager.record_post_step()
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            self.recorder_manager.record_pre_reset(reset_env_ids)
+            self._reset_idx(reset_env_ids)
+            if self.sim.has_rtx_sensors() and self.cfg.rerender_on_reset:
+                self.sim.render()
+            self.recorder_manager.record_post_reset(reset_env_ids)
+        self.command_manager.compute(dt=self.step_dt)
+        if "interval" in self.event_manager.available_modes:
+            self.event_manager.apply(mode="interval", dt=self.step_dt)
+        self.obs_buf = self.observation_manager.compute(update_history=True)
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
     
-    def _apply_residual_action(self, action: torch.Tensor):
-        """
-        Override action application to integrate base policy and residual actions.
-        
-        This method is called internally by Isaac Lab to apply actions to the robot.
-        We intercept here to:
-        1. Get base policy actions (12 DOF)
-        2. Get residual actions (4 DOF) 
-        3. Compute torques with modified PD parameters
-        4. Apply torques directly
-        
-        Args:
-            action: Residual actions from RL policy [num_envs, 4] (ankle PD modifications)
-        """
-        # Convert action to numpy if needed for action manager
-        if isinstance(action, torch.Tensor):
-            action_np = action.cpu().numpy()
-        else:
-            action_np = action
-        
-        # Process residual actions through action manager (scaling/clipping)
-        # This gives us processed residual actions (4 DOF)
-        self.action_manager.process_action(action_np)
-        processed_residual_actions_list = self.action_manager.processed_actions()
-        
-        # Convert to tensor
-        if isinstance(processed_residual_actions_list, list):
-            processed_residual_actions = torch.tensor(
-                processed_residual_actions_list, device=self.device, dtype=torch.float32
-            )
-        else:
-            processed_residual_actions = torch.from_numpy(
-                np.array(processed_residual_actions_list, dtype=np.float32)
-            ).to(self.device)
-        
-        # Ensure correct shape [num_envs, 4]
+    def _compute_and_apply_residual_torques(self):
+        """Compute torques from base and residual policies and write them to the robot."""
+        processed_residual_actions = (
+            self.action_manager.get_term(self._residual_action_term_name).processed_actions.clone()
+        )
         num_envs = self.scene.num_envs
         if processed_residual_actions.dim() == 1:
             processed_residual_actions = processed_residual_actions.unsqueeze(0).repeat(num_envs, 1)
         elif processed_residual_actions.shape[0] != num_envs:
-            # If single action, repeat for all environments
             if processed_residual_actions.shape[0] == 1:
                 processed_residual_actions = processed_residual_actions.repeat(num_envs, 1)
             else:
                 processed_residual_actions = processed_residual_actions[:num_envs]
-        
         # ====================================================================
         # GET BASE POLICY ACTIONS (12 DOF) - BYPASS ACTION MANAGER
         # ====================================================================
         if self.base_policy is not None:
             # Construct base policy observations
             base_obs = self._get_base_policy_observations()
+            self._last_base_obs_env0 = base_obs[0].detach().to("cpu")
             
             # Get base policy actions (no gradients)
             with torch.no_grad():
@@ -294,7 +295,15 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
         # ====================================================================
         # COMPUTE TORQUES WITH MODIFIED ANKLE PD PARAMETERS
         # ====================================================================
-        torques = self._compute_torques_with_modified_pd(base_actions, processed_residual_actions)
+        robot: Articulation = self.scene["robot"]
+        torques, target_positions = self._compute_torques_with_modified_pd(base_actions, processed_residual_actions)
+        self._debug_log_step(
+            processed_residual_actions,
+            base_actions,
+            torques,
+            target_positions,
+            robot,
+        )
         
         # ====================================================================
         # APPLY TORQUES DIRECTLY TO ROBOT
@@ -305,7 +314,9 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
         # Note: We've applied torques directly, so we bypass the normal action application
         # The parent class's step() will handle simulation stepping, observations, rewards, etc.
 
-    def _compute_torques_with_modified_pd(self, base_actions: torch.Tensor, residual_actions: torch.Tensor) -> torch.Tensor:
+    def _compute_torques_with_modified_pd(
+        self, base_actions: torch.Tensor, residual_actions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute joint torques with modified ankle PD parameters.
         
@@ -315,6 +326,7 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
             
         Returns:
             torques: Joint torques [num_envs, 12]
+            target_positions: Position targets sent to PD [num_envs, 12]
         """
         robot: Articulation = self.scene["robot"]
         
@@ -343,11 +355,122 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
         # Compute torques using PD control: τ = kp * (q_target - q_current) - kd * dq_current
         torques = kp * (target_positions - joint_pos) - kd * joint_vel
         
-        # Clip torques to limits
-        torque_limits = robot.data.joint_effort_limit
-        torques = torch.clamp(torques, -torque_limits, torque_limits)
+        # Clip torques to limits if available
+        if self.joint_effort_limits is not None:
+            torques = torch.clamp(torques, -self.joint_effort_limits, self.joint_effort_limits)
         
-        return torques
+        return torques, target_positions
+
+    def _build_joint_effort_limits(self, robot: Articulation):
+        """Create joint effort limit tensor per joint using actuator config."""
+        joint_names = robot.data.joint_names
+        num_envs = self.scene.num_envs
+        num_joints = len(joint_names)
+        limits = torch.full((num_joints,), float("inf"), dtype=torch.float32, device=self.device)
+        actuator_cfgs = getattr(robot.cfg, "actuators", {})
+        for actuator_cfg in actuator_cfgs.values():
+            effort_limit = getattr(actuator_cfg, "effort_limit_sim", None)
+            joint_exprs = getattr(actuator_cfg, "joint_names_expr", [])
+            if effort_limit is None or not joint_exprs:
+                continue
+            for expr in joint_exprs:
+                pattern = re.compile(expr)
+                for idx, name in enumerate(joint_names):
+                    if pattern.fullmatch(name) or pattern.match(name):
+                        limits[idx] = float(effort_limit)
+        if torch.isinf(limits).all():
+            return None
+        return limits.unsqueeze(0).repeat(num_envs, 1)
+
+    def _debug_log_step(self, residual_actions, base_actions, torques, target_positions, robot):
+        if not self.debug_log or self._debug_logs_emitted >= self.debug_max_logs:
+            self._debug_step_counter += 1
+            return
+        if self._debug_step_counter % max(1, self.debug_log_interval) == 0:
+            env_id = 0
+            joint_pos = robot.data.joint_pos[env_id].detach().cpu().numpy()
+            joint_vel = robot.data.joint_vel[env_id].detach().cpu().numpy()
+            base_velocity_cmd = None
+            if hasattr(self, "command_manager") and self.command_manager is not None:
+                try:
+                    base_velocity_cmd = (
+                        self.command_manager.get_command("base_velocity")[env_id, :3].detach().cpu().tolist()
+                    )
+                except KeyError:
+                    base_velocity_cmd = None
+            base_obs_sample = None
+            if hasattr(self, "_last_base_obs_env0"):
+                base_obs_sample = self._last_base_obs_env0.detach().cpu().tolist()
+            root_pos = robot.data.root_pos_w[env_id].detach().cpu().tolist()
+            root_lin_vel = robot.data.root_lin_vel_w[env_id].detach().cpu().tolist()
+            root_ang_vel = robot.data.root_ang_vel_w[env_id].detach().cpu().tolist()
+            root_quat = robot.data.root_quat_w[env_id].detach().cpu().tolist()
+            print(
+                "[DEBUG] Step",
+                self._debug_step_counter,
+                {
+                    "residual_actions": residual_actions[env_id].detach().cpu().tolist(),
+                    "base_actions": base_actions[env_id].detach().cpu().tolist(),
+                    "base_velocity_cmd": base_velocity_cmd,
+                    "base_obs_env0": base_obs_sample,
+                    "ankle_kp": self.current_ankle_kp[env_id].detach().cpu().tolist(),
+                    "ankle_kd": self.current_ankle_kd[env_id].detach().cpu().tolist(),
+                    "torques": torques[env_id].detach().cpu().tolist(),
+                    "target_pos": target_positions[env_id].detach().cpu().tolist(),
+                    "joint_pos": joint_pos.tolist(),
+                    "joint_vel": joint_vel.tolist(),
+                    "root_pos_w": root_pos,
+                    "root_lin_vel_w": root_lin_vel,
+                    "root_ang_vel_w": root_ang_vel,
+                    "root_quat_w": root_quat,
+                },
+            )
+            self._debug_logs_emitted += 1
+        self._debug_step_counter += 1
+
+    # ---------------------------------------------------------------------- #
+    # Base policy helper utilities
+    # ---------------------------------------------------------------------- #
+
+    def _initialize_base_policy_memory(self):
+        """Resize base policy recurrent state to match number of environments."""
+        if not self.base_policy_loaded or not hasattr(self.base_policy, "memory"):
+            return
+        try:
+            num_layers = getattr(self.base_policy.memory, "num_layers", 1)
+            hidden_size = getattr(self.base_policy.memory, "hidden_size", self.base_policy.hidden_state.shape[-1])
+        except AttributeError:
+            return
+        num_envs = self.scene.num_envs
+        device = self.device
+        hidden_state = torch.zeros(num_layers, num_envs, hidden_size, device=device)
+        cell_state = torch.zeros(num_layers, num_envs, hidden_size, device=device)
+        self.base_policy.hidden_state = hidden_state
+        self.base_policy.cell_state = cell_state
+        if hasattr(self.base_policy, "reset_memory"):
+            self.base_policy.reset_memory()
+
+    def _reset_base_policy_memory(self, env_ids: Sequence[int] | None = None):
+        """Zero base policy recurrent state for specified environments."""
+        if not (self.base_policy_loaded and hasattr(self.base_policy, "hidden_state")):
+            return
+        if env_ids is None:
+            self.base_policy.hidden_state.zero_()
+            if hasattr(self.base_policy, "cell_state"):
+                self.base_policy.cell_state.zero_()
+            return
+        if isinstance(env_ids, torch.Tensor):
+            env_ids_tensor = env_ids.to(dtype=torch.long, device=self.base_policy.hidden_state.device)
+        else:
+            env_ids_tensor = torch.as_tensor(env_ids, device=self.base_policy.hidden_state.device, dtype=torch.long)
+        self.base_policy.hidden_state[:, env_ids_tensor, :] = 0.0
+        if hasattr(self.base_policy, "cell_state"):
+            self.base_policy.cell_state[:, env_ids_tensor, :] = 0.0
+
+    def _reset_idx(self, env_ids: Sequence[int]):
+        """Reset environments and associated base policy memory."""
+        super()._reset_idx(env_ids)
+        self._reset_base_policy_memory(env_ids)
 
     def _get_base_policy_observations(self) -> torch.Tensor:
         """
@@ -374,22 +497,25 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
         sin_phase = torch.sin(2 * np.pi * phase_value).unsqueeze(1)
         cos_phase = torch.cos(2 * np.pi * phase_value).unsqueeze(1)
         
-        # Get base angular velocity
+        # Get base angular velocity in body frame
         base_ang_vel = robot.data.root_ang_vel_b  # [num_envs, 3]
         
-        # Get projected gravity (in base frame)
-        # Projected gravity is the gravity vector rotated to base frame
-        # For now, we'll use a simplified version
-        # In full implementation, this would be computed from base orientation
-        projected_gravity = torch.zeros(self.scene.num_envs, 3, device=self.device)
-        # TODO: Compute proper projected gravity from base orientation
+        # Compute projected gravity by rotating world gravity vector into body frame
+        root_quat_w = robot.data.root_quat_w  # [num_envs, 4]
+        gravity_vec_w = torch.zeros(self.scene.num_envs, 3, device=self.device, dtype=root_quat_w.dtype)
+        gravity_vec_w[:, 2] = -1.0
+        projected_gravity = math_utils.quat_apply_inverse(root_quat_w, gravity_vec_w)
         
-        # Get velocity commands (from command manager)
-        # For now, use zero commands or get from config
-        commands = torch.zeros(self.scene.num_envs, 3, device=self.device)
-        if hasattr(self, "command_manager"):
-            # Try to get commands from command manager if available
-            pass
+        # Get velocity commands (from command manager) and scale them
+        if hasattr(self, "command_manager") and self.command_manager is not None:
+            try:
+                commands = self.command_manager.get_command("base_velocity")[:, :3]
+            except KeyError:
+                commands = torch.zeros(self.scene.num_envs, 3, device=self.device, dtype=base_ang_vel.dtype)
+        else:
+            commands = torch.zeros(self.scene.num_envs, 3, device=self.device, dtype=base_ang_vel.dtype)
+        command_scales = torch.tensor(self.base_obs_scales["cmd"], device=self.device, dtype=commands.dtype)
+        scaled_commands = commands * command_scales
         
         # Get joint positions and velocities
         joint_pos = robot.data.joint_pos  # [num_envs, 12]
@@ -404,7 +530,7 @@ class G1ResidualRLEnv(ManagerBasedRLEnv):
         base_obs = torch.cat((
             base_ang_vel * self.base_obs_scales["ang_vel"],  # [0:3]
             projected_gravity,  # [3:6]
-            commands * torch.tensor(self.base_obs_scales["cmd"], device=self.device),  # [6:9]
+            scaled_commands,  # [6:9]
             (joint_pos - default_joint_pos) * self.base_obs_scales["dof_pos"],  # [9:21]
             joint_vel * self.base_obs_scales["dof_vel"],  # [21:33]
             self.last_base_actions,  # [33:45] - previous actions

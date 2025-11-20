@@ -134,14 +134,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # Set base policy path if provided
+    # Determine default path upfront
+    default_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "trained_models", "motion.pt"))
     if args_cli.base_policy_path is not None:
-        if hasattr(env_cfg, "base_policy_path"):
-            env_cfg.base_policy_path = args_cli.base_policy_path
-        print(f"[INFO] Using base policy from: {args_cli.base_policy_path}")
+        provided_path = os.path.abspath(args_cli.base_policy_path)
+        if os.path.exists(provided_path):
+            if hasattr(env_cfg, "base_policy_path"):
+                env_cfg.base_policy_path = provided_path
+            print(f"[INFO] Using base policy from: {provided_path}")
+        elif os.path.exists(default_path) and hasattr(env_cfg, "base_policy_path"):
+            print(
+                f"[WARN] Base policy path '{provided_path}' not found. Falling back to default pretrained policy: {default_path}"
+            )
+            env_cfg.base_policy_path = default_path
+        else:
+            print(
+                f"[WARN] Base policy path '{provided_path}' not found and default policy missing. Training without base policy."
+            )
+            if hasattr(env_cfg, "base_policy_path"):
+                env_cfg.base_policy_path = None
     else:
-        # Default path to pretrained policy
-        default_path = os.path.join(os.path.dirname(__file__), "..", "trained_models", "motion.pt")
-        default_path = os.path.abspath(default_path)
         if os.path.exists(default_path) and hasattr(env_cfg, "base_policy_path"):
             env_cfg.base_policy_path = default_path
             print(f"[INFO] Using default base policy from: {default_path}")
