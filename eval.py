@@ -5,27 +5,27 @@ from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points
 import numpy as np
 
-def calculate_signed_distance_cop_com(model, data):
-    """
-    Calculates the signed distance between the Center of Pressure (CoP) and the Center of Mass (CoM).
+# def calculate_signed_distance_cop_com(model, data):
+#     """
+#     Calculates the signed distance between the Center of Pressure (CoP) and the Center of Mass (CoM).
 
-    Args:
-        model: MjModel object.
-        data: MjData object with up-to-date simulation state.
+#     Args:
+#         model: MjModel object.
+#         data: MjData object with up-to-date simulation state.
 
-    Returns:
-        The signed distance as a float.
-    """
-    # Step 1: Calculate the Center of Mass (CoM)
-    com_pos = data.subtree_com[0]
+#     Returns:
+#         The signed distance as a float.
+#     """
+#     # Step 1: Calculate the Center of Mass (CoM)
+#     com_pos = data.subtree_com[0]
     
-    # Step 2: Calculate the Center of Pressure (CoP) as the contact force The center of pressure (CoP) is indeed the point where the sum of all pressure forces acts, creating a balance in moments (torques) from all directions around that specific point [1] 
-    cop_pos = 
+#     # Step 2: Calculate the Center of Pressure (CoP) as the contact force The center of pressure (CoP) is indeed the point where the sum of all pressure forces acts, creating a balance in moments (torques) from all directions around that specific point [1] 
+#     cop_pos = 
     
-    # Step 3: Calculate the signed distance
-    signed_distance = cop_pos[2] - com_pos[2]
+#     # Step 3: Calculate the signed distance
+#     signed_distance = cop_pos[2] - com_pos[2]
     
-    return signed_distance
+#     return signed_distance
 
 def calculate_mos(model, data, direction = "ml"):
     """

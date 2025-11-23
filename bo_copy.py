@@ -194,13 +194,17 @@ def run_single_episode(config, policy, model, data, cmd, max_steps, success_zone
 
     return ep_mos_mean, total_time, float(total_distance)
 
-def eval(enable_viewer=False, kp_ankle_pitch=30.0, kp_ankle_roll=30.0, name="perlin"):
+
+def eval(enable_viewer=False, kp_ankle_pitch_st=30.0, kp_ankle_roll_st=30.0, kp_ankle_pitch_sw=30.0, kp_ankle_roll_sw=30.0, name="perlin"):
     print(f"G1 {name} Terrain Testing")
     print("=" * 50)
 
-    config = load_g1_config()
-    config['kp_p'] = kp_ankle_pitch  # ankle pitch stiffness
-    config['kp_r'] = kp_ankle_roll   # ankle roll stiffness
+    config = load_g1_config()    
+    
+    config['kp_p_st'] = kp_ankle_pitch_st  # ankle pitch stiffness in stance
+    config['kp_r_st'] = kp_ankle_roll_st  # ankle roll stiffness in stance
+    config['kp_p_sw'] = kp_ankle_pitch_sw  # ankle pitch stiffness in swing
+    config['kp_r_sw'] = kp_ankle_roll_sw  # ankle roll stiffness in swing
     policy = load_policy(config['policy_path'])
 
     
@@ -280,7 +284,7 @@ def BO_pipeline():
     ]
 
     result = gp_minimize(
-        lambda p: trial(p, config),
+        lambda p: trial(p, config, name = "ramp"),
         param_bounds,
         n_calls=40,
         random_state=42,
@@ -313,6 +317,7 @@ def BO_pipeline():
 if __name__ == "__main__":
     # Set enable_viewer=True for rendering, False for headless
     # eval(enable_viewer=True, kp_ankle_pitch=20.0, kp_ankle_roll=20.0)
-    eval(enable_viewer = False, kp_ankle_pitch=20.0, kp_ankle_roll=20.0, name = "ramp")
+    # eval(enable_viewer = False, kp_ankle_pitch=20.0, kp_ankle_roll=20.0, name = "ramp")
     # eval(enable_viewer=False, kp_ankle_pitch=54.0, kp_ankle_roll=48.0)
-    # BO_pipeline()
+    BO_pipeline() # or 
+    eval(enable_viewer=False, kp_ankle_pitch_st=54.0, kp_ankle_roll_st=48.0, kp_ankle_pitch_sw=54.0, kp_ankle_roll_sw=48.0, name="perlin")
