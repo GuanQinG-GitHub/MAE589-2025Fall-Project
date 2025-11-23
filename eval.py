@@ -5,6 +5,28 @@ from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points
 import numpy as np
 
+def calculate_signed_distance_cop_com(model, data):
+    """
+    Calculates the signed distance between the Center of Pressure (CoP) and the Center of Mass (CoM).
+
+    Args:
+        model: MjModel object.
+        data: MjData object with up-to-date simulation state.
+
+    Returns:
+        The signed distance as a float.
+    """
+    # Step 1: Calculate the Center of Mass (CoM)
+    com_pos = data.subtree_com[0]
+    
+    # Step 2: Calculate the Center of Pressure (CoP) as the contact force The center of pressure (CoP) is indeed the point where the sum of all pressure forces acts, creating a balance in moments (torques) from all directions around that specific point [1] 
+    cop_pos = 
+    
+    # Step 3: Calculate the signed distance
+    signed_distance = cop_pos[2] - com_pos[2]
+    
+    return signed_distance
+
 def calculate_mos(model, data, direction = "ml"):
     """
     Calculates the Margin of Stability (MoS) for a Unitree H1 in MuJoCo.
@@ -33,13 +55,9 @@ def calculate_mos(model, data, direction = "ml"):
     # Step 3: Calculate the Extrapolated Center of Mass (XCoM)
     g = abs(model.opt.gravity[2])
     z_com = com_pos[2]
-    if z_com < 1e-6:
-        # Handle cases where CoM is at or below ground level
-        return -np.inf
-    
     omega0 = np.sqrt(g / z_com)
 
-    com_vel = data.subtree_linvel[pelvis_id,:2] # velocity
+    com_vel = data.qvel[:2] # velocity
     com_vel_forward = np.dot(com_vel[:2], heading_2d[:2]) * heading_2d[:2]  # project onto heading direction
     com_vel_ml = com_vel - com_vel_forward # in heading frame
 
@@ -60,21 +78,10 @@ def calculate_mos(model, data, direction = "ml"):
 
         if contact_force_magnitude > force_threshold:
             # Assuming ground is the second geom in the contact pair
-            if model.geom(contact.geom2).name == "perlin_terrain_1" or model.geom(contact.geom1).name == "perlin_terrain_1" or \
+            if "terrain_1" in model.geom(contact.geom2).name or "terrain_1" in model.geom(contact.geom1).name or \
                 model.geom(contact.geom2).name == "floor" or model.geom(contact.geom1).name == "floor":
                 contact_points.append(contact.pos)
     
-    if len(contact_points) < 3:
-        # If there are fewer than 3 stable contact points, the BoS is undefined
-        return -np.inf
-
-    # Project contact points onto the ground plane
-    ground_contacts = np.array([p[:2] for p in contact_points])
-    
-    # Compute the convex hull of the ground contacts
-    hull = ConvexHull(ground_contacts)
-    support_polygon = ground_contacts[hull.vertices]
-
     # Step 5: Calculate the Margin of Stability (MoS)
     dir_key = (direction or "forward").lower()
     if dir_key in ("forward", "f"):
@@ -85,6 +92,43 @@ def calculate_mos(model, data, direction = "ml"):
         xco = xcom
     else:
         raise ValueError(f"Unknown direction '{direction}'. Expected 'forward', 'lateral', or 'full'.")
+
+    if len(contact_points) < 3:
+        # If fewer than 3 points, BoS is not a polygon.
+        # Provide a continuous estimate based on distance to available contacts.
+        if len(contact_points) == 0:
+            return -1.0 # Large penalty for no contact
+        
+        xcom_p = np.array([xco[0], xco[1]])
+        
+        if len(contact_points) == 1:
+            # Distance to single point
+            p1 = np.array(contact_points[0][:2])
+            dist = np.linalg.norm(xcom_p - p1)
+            return -dist
+            
+        elif len(contact_points) == 2:
+            # Distance to line segment
+            p1 = np.array(contact_points[0][:2])
+            p2 = np.array(contact_points[1][:2])
+            
+            # Project point onto line segment
+            l2 = np.sum((p1 - p2)**2)
+            if l2 == 0:
+                dist = np.linalg.norm(xcom_p - p1)
+            else:
+                t = np.dot(xcom_p - p1, p2 - p1) / l2
+                t = max(0, min(1, t))
+                projection = p1 + t * (p2 - p1)
+                dist = np.linalg.norm(xcom_p - projection)
+            return -dist
+
+    # Project contact points onto the ground plane
+    ground_contacts = np.array([p[:2] for p in contact_points])
+    
+    # Compute the convex hull of the ground contacts
+    hull = ConvexHull(ground_contacts)
+    support_polygon = ground_contacts[hull.vertices]
 
     xcom_point = Point(xco[0], xco[1])  
     support_polygon_shape = Polygon(support_polygon)
@@ -127,3 +171,75 @@ def calculate_com_jerk(data, prev_com_acc, dt):
     # Return the magnitude of the jerk vector
     return np.linalg.norm(com_jerk), com_acc
 
+def calculate_heading_deviation(model, data, target_heading):
+    """
+    Calculates the deviation of the robot's heading from a target heading.
+
+    Args:
+        model: MjModel object.
+        data: MjData object with up-to-date simulation state.
+        target_heading: Target heading angle in radians. 
+    Returns:
+        The heading deviation in radians.
+    """             
+
+    # Determine the pelvis body index robustly (different mujoco wrappers expose different APIs)
+    body_name = 'pelvis'
+    pelvis_id = model.body(body_name).id
+    mat = data.xmat[pelvis_id,:].reshape(3, 3)
+    heading_3d = mat[:, 0]  # assume body x-axis is forward; change index if different
+
+    # Project heading onto horizontal plane
+    heading_2d = heading_3d.copy()
+    heading_2d[2] = 0.0
+    heading_2d = heading_2d / (np.linalg.norm(heading_2d) + 1e-8)
+
+    # Calculate current heading angle
+    current_heading = np.arctan2(heading_2d[1], heading_2d[0])
+
+    # Calculate deviation from target heading
+    deviation = current_heading - target_heading
+
+    # Normalize deviation to the range [-pi, pi]
+    deviation = (deviation + np.pi) % (2 * np.pi) - np.pi
+
+    return deviation
+
+
+def calculate_cop_trajectory(model, data, foot_names):
+    """
+    Calculates the Center of Pressure (CoP) trajectory for specified feet.
+
+    Args:
+        model: MjModel object.
+        data: MjData object with up-to-date simulation state.
+        foot_names: List of foot geom names to consider for CoP calculation.   
+    Returns:
+        The CoP position as a numpy array [x, y].
+    """         
+    total_force = np.zeros(3)
+    weighted_pos_sum = np.zeros(3)
+
+    for i in range(data.ncon):
+        contact = data.contact[i]
+        geom1_name = model.geom(contact.geom1).name
+        geom2_name = model.geom(contact.geom2).name
+
+        if geom1_name in foot_names or geom2_name in foot_names:
+            # MuJoCo contact force slice
+            efc_addr = int(contact.efc_address)
+            dim = int(contact.dim)
+            contact_force_vector = np.array(data.efc_force[efc_addr: efc_addr + dim])
+
+            force_magnitude = np.linalg.norm(contact_force_vector)
+            contact_pos = contact.pos
+
+            total_force += contact_force_vector
+            weighted_pos_sum += contact_pos * force_magnitude
+
+    if np.linalg.norm(total_force) < 1e-6:
+        # No significant contact forces detected
+        return np.array([np.nan, np.nan])
+
+    cop_position = weighted_pos_sum / np.linalg.norm(total_force)
+    return cop_position[:2]  # Return only x, y components

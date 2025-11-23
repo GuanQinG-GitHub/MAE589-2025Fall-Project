@@ -3,11 +3,13 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 import torch
-from eval import calculate_mos
-from utils import load_g1_config, load_policy, combine_robot_and_terrain, get_gravity_orientation
+from eval import *
+from src.utils import load_g1_config, load_policy, combine_robot_and_terrain, get_gravity_orientation
 from src.scheduler.scheduler import ImpedanceScheduler
 from skopt import gp_minimize
 import os
+from src.vis_utils import *
+import matplotlib.pyplot as plt
 
 def run_single_episode(config, policy, model, data, cmd, max_steps, success_zones, render = False, viewer = None):
     """
@@ -15,6 +17,7 @@ def run_single_episode(config, policy, model, data, cmd, max_steps, success_zone
     Returns a tuple: (mean margin of stability (MoS), total_timesteps, total_travel_distance).
     """
     mujoco.mj_resetData(model, data)
+    print(data.qpos[:3])
     counter = 0
     fall_count = 0
     max_height = -np.inf
@@ -29,6 +32,15 @@ def run_single_episode(config, policy, model, data, cmd, max_steps, success_zone
     action = np.zeros(config['num_actions'], dtype=np.float32)
     zone_visits = {zone["name"]: False for zone in success_zones}
     mos_list = []
+    
+    # Logging lists
+    log_time = []
+    log_kp_pitch = []
+    log_kp_roll = []
+    log_mos_step = []
+    log_foot = [] # Left and Right foot Z positions
+    log_hip_angle = []
+    
     # print("kp ankle pitch:", kp_ankle_pitch)
     # print("kp ankle roll:", kps_ankle_roll)
     while (viewer.is_running() if render else True) and counter < max_steps:
@@ -41,9 +53,20 @@ def run_single_episode(config, policy, model, data, cmd, max_steps, success_zone
         counter += 1
 
         mos = calculate_mos(model, data, direction = 'ml')
+        mos_ap = calculate_mos(model, data, direction = 'f')
         if mos != -np.inf and not np.isnan(mos):
-            mos_list.append(float(mos))
-
+            mos_list.append([float(mos), float(mos_ap)])
+            
+        # Log data every control step (or every step?)
+        # Let's log every control step to match update frequency
+        if counter % config['control_decimation'] == 0:
+            sim_time = counter * model.opt.timestep * config['control_decimation']
+            log_time.append(sim_time)
+            log_kp_pitch.append([kps[4], kps[10]]) # Log Left/ Right Ankle Pitch
+            log_kp_roll.append([kps[5], kps[11]])  # Log Left/ Right Ankle Roll
+            log_mos_step.append(mos_list[-1] if mos_list else [np.nan, np.nan])
+            log_foot.append([data.xpos[model.body('right_ankle_pitch_link').id].copy(), data.xpos[model.body('left_ankle_pitch_link').id].copy()]) # Log foot positions
+            log_hip_angle.append(data.qpos[7:10].copy())  # Log hip joint angles
         if counter % config['control_decimation'] == 0:
             kps, kds = scheduler.update_gains(data, model)
             qj = data.qpos[7:7 + config["num_actions"]].copy()
@@ -105,10 +128,74 @@ def run_single_episode(config, policy, model, data, cmd, max_steps, success_zone
 
     ep_mos_mean = float(np.mean(mos_list)) if mos_list else float('nan')
     total_time = counter *model.opt.timestep # in seconds
+    
+    # Visualization
+    if log_time:
+        plt.figure(figsize=(10, 10))
+        
+        plt.subplot(5, 1, 1)
+        plt.plot(log_time, np.array(log_kp_pitch)[:, 0], label='Kp Pitch left')
+        plt.plot(log_time, np.array(log_kp_roll)[:, 0], label='Kp Roll left')
+        plt.plot(log_time, np.array(log_kp_pitch)[:, 1], label='Kp Pitch right')
+        plt.plot(log_time, np.array(log_kp_roll)[:, 1], label='Kp Roll right')
+        
+        plt.ylabel('Stiffness (Kp)')
+        plt.title('Ankle Stiffness over Time')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.subplot(5, 1, 2)
+        plt.plot(log_time, np.array(log_mos_step)[:, 0], label='MoS ML', color='orange')
+        plt.plot(log_time, np.array(log_mos_step)[:, 1], label='MoS AP', color='blue')
+        plt.ylabel('Margin of Stability (MoS)')
+        plt.xlabel('Time (s)')
+        plt.title('MoS over Time')
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(5, 1, 3)
+        plt.plot(log_time, np.array(log_foot)[:, 0, 2], label='Left Foot Z', color='green')
+        plt.plot(log_time, np.array(log_foot)[:, 1, 2], label='Right Foot Z', color='red')
+        plt.ylabel('Foot Z Position (m)')
+        plt.xlabel('Time (s)')
+        plt.title('Foot Z Positions over Time')
+        plt.legend()
+        plt.grid(True)
+
+        print(np.array(log_foot).shape)
+
+        plt.subplot(5, 1, 4)
+        plt.plot( np.array(log_foot)[:, 0, 0], np.array(log_foot)[:, 0, 1], label='Left Foot XY', color='purple')
+        plt.plot( np.array(log_foot)[:, 1, 0], np.array(log_foot)[:, 1, 1], label='Right Foot XY', color='brown')
+        plt.xlabel('X Position (m)')
+        plt.ylabel('Y Position (m)')
+        plt.title('Foot XY Trajectories')
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(5, 1, 5)
+        plt.plot(log_time, np.array(log_hip_angle)[:, 0], label='Hip Joint 1', color='cyan')
+        plt.plot(log_time, np.array(log_hip_angle)[:, 1], label='Hip Joint 2', color='magenta')
+        plt.plot(log_time, np.array(log_hip_angle)[:, 2], label='Hip Joint 3', color='yellow')
+        plt.ylabel('Hip Joint Angles (rad)')
+        plt.xlabel('Time (s)')
+        plt.title('Hip Joint Angles over Time')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        # Save plot
+        os.makedirs("logs", exist_ok=True)
+        plot_path = f"logs/episode_log_{int(time.time() * 1000)}.png"
+        plt.savefig(plot_path)
+        print(f"Episode log saved to {plot_path}")
+        
+
+
     return ep_mos_mean, total_time, float(total_distance)
 
-def main(enable_viewer=False, kp_ankle_pitch=30.0, kp_ankle_roll=30.0):
-    print("G1 Perlin Terrain Testing")
+def eval(enable_viewer=False, kp_ankle_pitch=30.0, kp_ankle_roll=30.0, name="perlin"):
+    print(f"G1 {name} Terrain Testing")
     print("=" * 50)
 
     config = load_g1_config()
@@ -116,19 +203,20 @@ def main(enable_viewer=False, kp_ankle_pitch=30.0, kp_ankle_roll=30.0):
     config['kp_r'] = kp_ankle_roll   # ankle roll stiffness
     policy = load_policy(config['policy_path'])
 
-    combined_xml = combine_robot_and_terrain(config["robot_xml_path"])
+    
+    combined_xml = combine_robot_and_terrain(config["robot_xml_path"], terrain_name=f"{name}_terrain_1", terrain_file=f"../../../terrains/g1_{name}_terrain_1.png", degree = 15)
     model = mujoco.MjModel.from_xml_string(combined_xml)
     model.opt.timestep = config['simulation_dt']
-
     cmd = config.get("cmd_init", np.array([1.0, 0.0, 0.0], dtype=np.float32)).copy()
     success_zones = [
-        {"name": "Perlin Terrain", "pos": [5, 0], "radius": 1.5, "description": "Main Perlin terrain area (moderate complexity)"}
+        {"name": f"{name} Terrain", "pos": [5, 0], "radius": 1.5, "description": f"vis {name} terrain area (moderate complexity)"}
     ]
     num_episodes = 5
     max_steps = int(config['simulation_duration'] / config['simulation_dt'])
     episode_mos_means = []
 
     for ep in range(1, num_episodes + 1):
+    
         data = mujoco.MjData(model)
         if enable_viewer:
             with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -144,18 +232,20 @@ def main(enable_viewer=False, kp_ankle_pitch=30.0, kp_ankle_roll=30.0):
 
     print(f"\nAverage MoS over {num_episodes} episodes: {np.nanmean(episode_mos_means):.2f}")
 
-def evaluate(ankle_stiffness, config):
-    config['kp_p'] = ankle_stiffness[0] # ankle pitch stiffness
-    config['kp_r'] = ankle_stiffness[1]  # ankle roll stiffness
+def trial(ankle_stiffness, config, name="perlin"):
+    config['kp_p_st'] = ankle_stiffness[0] # ankle pitch stiffness in stance
+    config['kp_r_st'] = ankle_stiffness[1]  # ankle roll stiffness in stance
+    config['kp_p_sw'] = ankle_stiffness[2]  # ankle pitch stiffness in swing
+    config['kp_r_sw'] = ankle_stiffness[3]  # ankle roll stiffness in swing
     policy = load_policy(config['policy_path'])
 
-    combined_xml = combine_robot_and_terrain(config["robot_xml_path"])
+    combined_xml = combine_robot_and_terrain(config["robot_xml_path"], terrain_name=f"{name}_terrain_1", terrain_file=f"../../../terrains/g1_{name}_terrain_1.png")
     model = mujoco.MjModel.from_xml_string(combined_xml)
     model.opt.timestep = config['simulation_dt']
 
     cmd = config.get("cmd_init", np.array([1.0, 0.0, 0.0], dtype=np.float32)).copy()
     success_zones = [
-        {"name": "Perlin Terrain", "pos": [5, 0], "radius": 1.5, "description": "Main Perlin terrain area (moderate complexity)"}
+        {f"name": f"{name} Terrain", "pos": [5, 0], "radius": 1.5, "description": f"vis {name} terrain area (moderate complexity)"}
     ]
     num_episodes = config.get('num_episodes_per_eval', 4)
     max_steps = int(config['simulation_duration'] / config['simulation_dt'])
@@ -174,8 +264,8 @@ def evaluate(ankle_stiffness, config):
     print(f"Ankle Stiffness: {ankle_stiffness[0]:.2f}, {ankle_stiffness[1]:.2f}, Average MoS: {avg_mos:.2f}, Average Time: {avg_time:.2f}, Average Distance: {avg_distance:.2f}")
     return -avg_mos - avg_time*0.1 # Negative for minimization
 
-def main_pipeline():
-    print("G1 Perlin Terrain  BO")
+def BO_pipeline():
+    print("G1 {name} Terrain  BO")
     print("=" * 50)
 
     import matplotlib.pyplot as plt
@@ -184,11 +274,13 @@ def main_pipeline():
 
     param_bounds = [
         (15, 60),  # ankle stiffness range
-        (15, 60)   # ankle damping range
+        (15, 60),   # ankle damping range
+        (15, 60),  # ankle stiffness range
+        (15, 60)    # ankle damping range
     ]
 
     result = gp_minimize(
-        lambda p: evaluate(p, config),
+        lambda p: trial(p, config),
         param_bounds,
         n_calls=40,
         random_state=42,
@@ -213,39 +305,14 @@ def main_pipeline():
     for p, m in zip(explored, avg_mos_vals):
         print(f"  {p[0]:.3f}, {p[1]:.3f} -> {m:.4f}")
 
-    # Scatter plot: param1 vs param2 colored by avg_mos
-    plt.figure(figsize=(6, 5))
-    sc = plt.scatter(explored[:, 0], explored[:, 1], c=avg_mos_vals, cmap="viridis", s=80, edgecolors="k")
-    plt.colorbar(sc, label="Average cost")
-    plt.scatter([result.x[0]], [result.x[1]], marker="*", color="red", s=200, label="Best")
-    plt.plot([b[0] for b in param_bounds], [b[1] for b in param_bounds], 'r--', alpha=0.5)
-    plt.xlabel("Ankle stiffness pitch")
-    plt.ylabel("Ankle damping roll")
-    plt.title("BO explored points: params vs Average cost")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    fig_path = os.path.join(out_dir, "bo_param_vs_cost.png")
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=150)
-    print(f"Plot saved to: {fig_path}")
-    try:
-        plt.show()
-    except Exception:
-        # In headless environments, showing may fail; continue silently.
-        pass
-
-    print("Best stiffness:", result.x)
-    print("Best MoS achieved:", -result.fun)
-
-
-
+    
+    # _plot_and_save_bo_results(result, explored, avg_mos_vals, param_bounds, out_dir)
     return result
 
 
 if __name__ == "__main__":
     # Set enable_viewer=True for rendering, False for headless
-    # main(enable_viewer=True, kp_ankle_pitch=54.0, kp_ankle_roll=48.0)
-    main(enable_viewer=True, kp_ankle_pitch=20.0, kp_ankle_roll=20.0)
-    # main(enable_viewer=False, kp_ankle_pitch=54.0, kp_ankle_roll=48.0)
-    # main_pipeline()
-
+    # eval(enable_viewer=True, kp_ankle_pitch=20.0, kp_ankle_roll=20.0)
+    eval(enable_viewer = False, kp_ankle_pitch=20.0, kp_ankle_roll=20.0, name = "ramp")
+    # eval(enable_viewer=False, kp_ankle_pitch=54.0, kp_ankle_roll=48.0)
+    # BO_pipeline()

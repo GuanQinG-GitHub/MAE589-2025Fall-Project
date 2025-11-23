@@ -3,47 +3,6 @@ import os
 import numpy as np
 import torch
 
-def is_stance(data, model, side = 'left'):
-    # Determine if the requested side leg is in stance (i.e. contacting ground with sufficient force)
-    force_threshold = 0.5
-    side = side.lower()
-    stance = False
-
-    for i in range(data.ncon):
-        contact = data.contact[i]
-
-        # MuJoCo contact force slice
-        efc_addr = int(contact.efc_address)
-        dim = int(contact.dim)
-        contact_force_vector = np.array(data.efc_force[efc_addr: efc_addr + dim])
-
-        if np.linalg.norm(contact_force_vector) <= force_threshold:
-            continue
-
-        # check if contact involves ground
-        g1 = contact.geom1
-        g2 = contact.geom2
-        name1 = model.geom(g1).name.lower()
-        name2 = model.geom(g2).name.lower()
-
-        ground_hit = ("perlin_terrain_1" in name1 or "floor" in name1 or
-                      "perlin_terrain_1" in name2 or "floor" in name2)
-        if not ground_hit:
-            continue
-
-        # the non-ground geom is the foot
-        if "perlin_terrain_1" in name1 or "floor" in name1:
-            foot_name = name2
-        else:
-            foot_name = name1
-
-        # detect a foot geom for the requested side (match your XML naming)
-        if side in foot_name:
-            stance = True
-            break
-
-    return bool(stance)
-
 
 
 def get_gravity_orientation(quaternion):
@@ -130,7 +89,9 @@ def load_g1_config(json_path=None):
 
 
 
-def combine_robot_and_terrain(robot_xml_path):
+def combine_robot_and_terrain(robot_xml_path, terrain_name="perlin_terrain_1", terrain_file="../../../terrains/g1_perlin_terrain_1.png", degree=15):
+    
+    
     """Combine robot and terrain XML files into a single Mujoco model."""
     with open(robot_xml_path, 'r') as f:
         robot_xml_content = f.read()
@@ -141,10 +102,14 @@ def combine_robot_and_terrain(robot_xml_path):
         'meshdir="../robot_models/g1_description/meshes/"',
         'meshdir="robot_models/g1_description/meshes/"'
     )
+    
+    z_scale = 0.60 if terrain_name == "perlin_terrain_1" else 3.0
+    z_offset = 4.0 if terrain_name == "perlin_terrain_1" else 12.0
+
 
     # Create a combined scene by including the robot in the Perlin terrain scene
     combined_xml = f"""
-<mujoco model="g1 with perlin terrain">
+<mujoco model="g1 with {terrain_name}">
   <compiler meshdir="robot_models/g1_description/meshes/"/>
   
   <!-- Include robot model content directly -->
@@ -162,14 +127,14 @@ def combine_robot_and_terrain(robot_xml_path):
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
-    <hfield name="perlin_hfield_1" size="15.0 5.0 0.60 0.01" file="../../../terrains/g1_perlin_terrain_1.png" />
-    <material name="perlin_terrain_1_mat" rgba="0.3 0.5 0.3 1" roughness="0.5" />
+    <hfield name="{terrain_name}_hfield" size="15.0 15.0 {z_scale} 0.01" file="{terrain_file}" />
+    <material name="{terrain_name}_mat" rgba="0.3 0.5 0.3 1" roughness="0.5" />
   </asset>
 
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true" />
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" />
-    <geom name="perlin_terrain_1" type="hfield" hfield="perlin_hfield_1" pos="4.0 0.0 0.0" quat="1 0 0 0" material="perlin_terrain_1_mat" />
+    <geom name="{terrain_name}" type="hfield" hfield="{terrain_name}_hfield" pos="{4.0 if terrain_name == 'perlin_terrain_1' else 12.0} 0.0 0.0" quat="1 0 0 0" material="{terrain_name}_mat" />
   </worldbody>
 </mujoco>
 """
